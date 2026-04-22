@@ -35,6 +35,7 @@ import kafka.raft.KafkaRaftManager
 import kafka.server.metadata.{AclPublisher, BrokerMetadataPublisher, ClientQuotaMetadataManager, DelegationTokenPublisher, DynamicClientQuotaPublisher, DynamicConfigPublisher, KRaftMetadataCache, ScramPublisher}
 import kafka.server.streamaspect.{ElasticKafkaApis, ElasticReplicaManager, PartitionLifecycleListener}
 import kafka.utils.CoreUtils
+import org.apache.kafka.clients.admin.ClusterEventPublisher
 import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.feature.SupportedVersionRange
 import org.apache.kafka.common.message.ApiMessageType.ListenerType
@@ -175,6 +176,7 @@ class BrokerServer(
   config.addReconfigurable(clientRackProvider)
 
   var tableManager: TableManager = _
+  var requestErrorAccumulator: RequestErrorAccumulator = _
   // AutoMQ inject end
 
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
@@ -465,6 +467,23 @@ class BrokerServer(
         socketServer.dataPlaneRequestChannel, dataPlaneRequestProcessor, time,
         config.numIoThreads, s"${DataPlaneAcceptor.MetricPrefix}RequestHandlerAvgIdlePercent",
         DataPlaneAcceptor.ThreadPrefix)
+
+      // AutoMQ inject start - cluster event publisher and request error accumulator
+      try {
+        val publisherConfig = new java.util.HashMap[String, Object]()
+        kafka.automq.utils.ClientUtils.clusterClientBaseConfig(config).forEach { (k, v) =>
+          publisherConfig.put(k.toString, v)
+        }
+        config.rack.foreach(rack => publisherConfig.put("client.id", "automq_az=" + rack))
+        ClusterEventPublisher.setup(publisherConfig)
+        requestErrorAccumulator = new RequestErrorAccumulator(config.nodeId)
+        ClusterEventPublisher.registerEmitter(requestErrorAccumulator)
+        socketServer.dataPlaneRequestChannel.requestErrorAccumulator = requestErrorAccumulator
+      } catch {
+        case e: Throwable =>
+          error("Failed to initialize ClusterEventPublisher/RequestErrorAccumulator", e)
+      }
+      // AutoMQ inject end
 
       // Start RemoteLogManager before initializing broker metadata publishers.
       remoteLogManagerOpt.foreach { rlm =>
@@ -792,6 +811,10 @@ class BrokerServer(
 
       if (quotaManagers != null)
         CoreUtils.swallow(quotaManagers.shutdown(), this)
+
+      // AutoMQ inject start - shutdown cluster event publisher (also stops emitter scheduler)
+      CoreUtils.swallow(ClusterEventPublisher.shutdown(), this)
+      // AutoMQ inject end
 
       if (socketServer != null)
         CoreUtils.swallow(socketServer.shutdown(), this)
