@@ -99,20 +99,24 @@ public class LogCache {
     /**
      * Put a record batch into the cache.
      * record batched in the same stream should be put in order.
+     *
+     * @return true if the record was successfully added, false if the block is full (caller should archive and retry)
      */
     public boolean put(StreamRecordBatch recordBatch) {
         long startTime = System.nanoTime();
         tryRealFree();
-        size.addAndGet(recordBatch.occupiedSize());
         readLock.lock();
-        boolean full;
+        boolean added;
         try {
-            full = activeBlock.put(recordBatch);
+            added = activeBlock.put(recordBatch);
         } finally {
             readLock.unlock();
         }
+        if (added) {
+            size.addAndGet(recordBatch.occupiedSize());
+        }
         StorageOperationStats.getInstance().appendLogCacheStats.record(TimerUtil.timeElapsedSince(startTime, TimeUnit.NANOSECONDS));
-        return full;
+        return added;
     }
 
     public List<StreamRecordBatch> get(long streamId, long startOffset, long endOffset, int maxBytes) {
@@ -409,16 +413,14 @@ public class LogCache {
         synchronized (left) {
             left.size.addAndGet(right.size());
             left.lastRecordOffset = right.lastRecordOffset;
-            left.map.forEach((streamId, leftStreamCache) -> {
-                StreamCache rightStreamCache = right.map.get(streamId);
-                if (rightStreamCache != null) {
+            right.map.forEach((streamId, rightStreamCache) -> {
+                StreamCache leftStreamCache = left.map.get(streamId);
+                if (leftStreamCache == null) {
+                    left.map.put(streamId, new StreamCache(rightStreamCache));
+                } else {
                     leftStreamCache.records.addAll(rightStreamCache.records);
                     leftStreamCache.endOffset(rightStreamCache.endOffset());
-                }
-            });
-            right.map.forEach((streamId, rightStreamCache) -> {
-                if (!left.map.containsKey(streamId)) {
-                    left.map.put(streamId, rightStreamCache);
+                    leftStreamCache.offsetIndexMap.clear();
                 }
             });
         }
@@ -433,6 +435,7 @@ public class LogCache {
         private final long createdTimestamp = System.currentTimeMillis();
         private final AtomicLong size = new AtomicLong();
         private final List<FreeListener> freeListeners = new ArrayList<>();
+        private volatile boolean overflow;
         volatile boolean free;
         long freeOpsModCount;
         private RecordOffset lastRecordOffset;
@@ -452,19 +455,23 @@ public class LogCache {
         }
 
         public boolean isFull() {
-            return size.get() >= maxSize || map.size() >= maxStreamCount;
+            return overflow || size.get() >= maxSize || map.size() >= maxStreamCount;
         }
 
+        /**
+         * @return true if the record was successfully added, false if the block is full or would overflow
+         */
         public boolean put(StreamRecordBatch recordBatch) {
-            map.compute(recordBatch.getStreamId(), (id, cache) -> {
-                if (cache == null) {
-                    cache = new StreamCache();
-                }
-                cache.add(recordBatch);
-                return cache;
-            });
+            if (isFull()) {
+                return false;
+            }
+            StreamCache cache = map.computeIfAbsent(recordBatch.getStreamId(), id -> new StreamCache());
+            if (!cache.add(recordBatch)) {
+                overflow = true;
+                return false;
+            }
             size.addAndGet(recordBatch.occupiedSize());
-            return isFull();
+            return true;
         }
 
         public List<StreamRecordBatch> get(Long streamId, long startOffset, long endOffset, int maxBytes) {
@@ -589,17 +596,31 @@ public class LogCache {
             this.records = new ArrayList<>();
         }
 
-        synchronized void add(StreamRecordBatch recordBatch) {
+        StreamCache(StreamCache other) {
+            this.records = new ArrayList<>(other.records);
+            this.startOffset = other.startOffset();
+            this.endOffset = other.endOffset();
+        }
+
+        /**
+         * @return true if the record was successfully added, false if it would cause offset overflow
+         */
+        synchronized boolean add(StreamRecordBatch recordBatch) {
             if (recordBatch.getBaseOffset() != endOffset && endOffset != NOOP_OFFSET) {
                 RuntimeException ex = new IllegalArgumentException(String.format("streamId=%s record batch base offset mismatch, expect %s, actual %s",
                     recordBatch.getStreamId(), endOffset, recordBatch.getBaseOffset()));
                 LOGGER.error("[FATAL]", ex);
+            }
+            long effectiveStartOffset = startOffset == NOOP_OFFSET ? recordBatch.getBaseOffset() : startOffset;
+            if (recordBatch.getLastOffset() - effectiveStartOffset > Integer.MAX_VALUE) {
+                return false;
             }
             records.add(recordBatch);
             if (startOffset == NOOP_OFFSET) {
                 startOffset = recordBatch.getBaseOffset();
             }
             endOffset = recordBatch.getLastOffset();
+            return true;
         }
 
         synchronized List<StreamRecordBatch> get(long startOffset, long endOffset, int maxBytes) {
